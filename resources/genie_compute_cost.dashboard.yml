@@ -1,0 +1,7 @@
+resources:
+  dashboards:
+    genie_compute_cost:
+      display_name: Genie & Compute Cost Dashboard
+      file_path: ../src/genie_compute_cost.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      embed_credentials: false

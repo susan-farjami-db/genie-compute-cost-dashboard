@@ -1,0 +1,19 @@
+bundle:
+  name: genie-compute-cost
+
+include:
+  - resources/*.yml
+
+variables:
+  warehouse_id:
+    description: ID of the SQL warehouse that runs the dashboard queries (a serverless warehouse is recommended).
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}

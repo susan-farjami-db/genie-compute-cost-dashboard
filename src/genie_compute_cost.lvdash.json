@@ -1,0 +1,2063 @@
+{
+  "datasets": [
+    {
+      "name": "genie_cost",
+      "displayName": "Genie cost (final)",
+      "queryLines": [
+        "-- Portable version: derives Genie cost from system tables (no custom tables needed)\n",
+        "WITH -- 1) LLM token cost \u2014 direct from Genie billing\n",
+        "token_cost AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    CAST(u.workspace_id AS STRING) AS workspace_id,\n",
+        "    COALESCE(u.usage_metadata.genie.agent_id, 'N/A') AS genie_space_id,\n",
+        "    COALESCE(u.usage_metadata.genie.agent_id, 'N/A') AS genie_space_name,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_SPACE' THEN 'Genie Agents'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      WHEN 'GENIE_CODE' THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE' THEN 'Genie One'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Unknown')\n",
+        "    END AS genie_type,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, '') AS genie_channel,\n",
+        "    'LLM tokens' AS cost_component,\n",
+        "    'billing' AS cost_source,\n",
+        "    u.identity_metadata.run_as AS user_email,\n",
+        "    '' AS warehouse_id,\n",
+        "    0 AS statements,\n",
+        "    0 AS task_ms,\n",
+        "    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS cost_usd,\n",
+        "    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS allocated_cost_usd,\n",
+        "    SUM(u.usage_quantity) AS allocated_dbu\n",
+        "  FROM\n",
+        "    system.billing.usage u\n",
+        "      JOIN system.billing.list_prices lp\n",
+        "        ON u.cloud = lp.cloud\n",
+        "        AND u.sku_name = lp.sku_name\n",
+        "        AND u.usage_start_time >= lp.price_start_time\n",
+        "        AND (\n",
+        "          lp.price_end_time IS NULL\n",
+        "          OR u.usage_start_time < lp.price_end_time\n",
+        "        )\n",
+        "  WHERE\n",
+        "    u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date >= CURRENT_DATE - INTERVAL 30 DAYS\n",
+        "  GROUP BY\n",
+        "    ALL\n",
+        "),\n",
+        "-- 2) Compute cost \u2014 attribute serverless SQL warehouse cost to Genie users by query task-time share\n",
+        "genie_user_wh_time AS (\n",
+        "  SELECT\n",
+        "    DATE(qh.end_time) AS usage_date,\n",
+        "    CAST(qh.workspace_id AS STRING) AS workspace_id,\n",
+        "    qh.executed_by AS user_email,\n",
+        "    qh.compute.warehouse_id AS warehouse_id,\n",
+        "    COUNT(*) AS statements,\n",
+        "    SUM(qh.total_task_duration_ms) AS task_ms\n",
+        "  FROM\n",
+        "    system.query.history qh\n",
+        "  WHERE\n",
+        "    qh.end_time >= CURRENT_DATE - INTERVAL 30 DAYS\n",
+        "    AND qh.statement_type IN ('SELECT', 'INSERT', 'MERGE', 'CREATE_TABLE_AS_SELECT')\n",
+        "    AND qh.compute.warehouse_id IS NOT NULL\n",
+        "    AND qh.executed_by IN (\n",
+        "      SELECT DISTINCT\n",
+        "        identity_metadata.run_as\n",
+        "      FROM\n",
+        "        system.billing.usage\n",
+        "      WHERE\n",
+        "        billing_origin_product = 'GENIE'\n",
+        "        AND usage_date >= CURRENT_DATE - INTERVAL 30 DAYS\n",
+        "        AND identity_metadata.run_as IS NOT NULL\n",
+        "    )\n",
+        "  GROUP BY\n",
+        "    ALL\n",
+        "),\n",
+        "warehouse_daily_cost AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.usage_metadata.warehouse_id AS warehouse_id,\n",
+        "    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS wh_cost,\n",
+        "    SUM(u.usage_quantity) AS wh_dbu\n",
+        "  FROM\n",
+        "    system.billing.usage u\n",
+        "      JOIN system.billing.list_prices lp\n",
+        "        ON u.cloud = lp.cloud\n",
+        "        AND u.sku_name = lp.sku_name\n",
+        "        AND u.usage_start_time >= lp.price_start_time\n",
+        "        AND (\n",
+        "          lp.price_end_time IS NULL\n",
+        "          OR u.usage_start_time < lp.price_end_time\n",
+        "        )\n",
+        "  WHERE\n",
+        "    u.sku_name LIKE '%SERVERLESS%SQL%'\n",
+        "    AND u.usage_date >= CURRENT_DATE - INTERVAL 30 DAYS\n",
+        "    AND u.usage_metadata.warehouse_id IS NOT NULL\n",
+        "  GROUP BY\n",
+        "    ALL\n",
+        "),\n",
+        "compute_cost AS (\n",
+        "  SELECT\n",
+        "    g.usage_date,\n",
+        "    g.workspace_id,\n",
+        "    'N/A' AS genie_space_id,\n",
+        "    'N/A' AS genie_space_name,\n",
+        "    'Genie Agents' AS genie_type,\n",
+        "    '' AS genie_channel,\n",
+        "    'Compute (SQL warehouse)' AS cost_component,\n",
+        "    'allocated' AS cost_source,\n",
+        "    g.user_email,\n",
+        "    g.warehouse_id,\n",
+        "    g.statements,\n",
+        "    g.task_ms,\n",
+        "    COALESCE(\n",
+        "      w.wh_cost\n",
+        "        * (g.task_ms / NULLIF(SUM(g.task_ms) OVER (PARTITION BY g.usage_date, g.warehouse_id), 0)),\n",
+        "      0\n",
+        "    ) AS cost_usd,\n",
+        "    COALESCE(\n",
+        "      w.wh_cost\n",
+        "        * (g.task_ms / NULLIF(SUM(g.task_ms) OVER (PARTITION BY g.usage_date, g.warehouse_id), 0)),\n",
+        "      0\n",
+        "    ) AS allocated_cost_usd,\n",
+        "    COALESCE(\n",
+        "      w.wh_dbu\n",
+        "        * (g.task_ms / NULLIF(SUM(g.task_ms) OVER (PARTITION BY g.usage_date, g.warehouse_id), 0)),\n",
+        "      0\n",
+        "    ) AS allocated_dbu\n",
+        "  FROM\n",
+        "    genie_user_wh_time g\n",
+        "      LEFT JOIN warehouse_daily_cost w\n",
+        "        ON g.usage_date = w.usage_date\n",
+        "        AND g.warehouse_id = w.warehouse_id\n",
+        "),\n",
+        "-- 3) Union both cost components\n",
+        "combined AS (\n",
+        "  SELECT\n",
+        "    *\n",
+        "  FROM\n",
+        "    token_cost\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    *\n",
+        "  FROM\n",
+        "    compute_cost\n",
+        ")\n",
+        "SELECT\n",
+        "  usage_date,\n",
+        "  'production' AS environment,\n",
+        "  workspace_id,\n",
+        "  genie_space_id,\n",
+        "  genie_space_name,\n",
+        "  genie_type,\n",
+        "  genie_channel,\n",
+        "  cost_component,\n",
+        "  cost_source,\n",
+        "  user_email,\n",
+        "  warehouse_id,\n",
+        "  statements,\n",
+        "  task_ms,\n",
+        "  cost_usd,\n",
+        "  CASE\n",
+        "    WHEN cost_component = 'Compute (SQL warehouse)' THEN cost_usd\n",
+        "    ELSE 0\n",
+        "  END AS compute_cost_usd,\n",
+        "  CASE\n",
+        "    WHEN cost_component = 'LLM tokens' THEN cost_usd\n",
+        "    ELSE 0\n",
+        "  END AS token_cost_usd,\n",
+        "  allocated_cost_usd,\n",
+        "  CASE\n",
+        "    WHEN genie_type = 'Genie Agents' THEN allocated_cost_usd\n",
+        "    ELSE 0\n",
+        "  END AS agents_cost_usd,\n",
+        "  CASE\n",
+        "    WHEN genie_type = 'Genie Code' THEN allocated_cost_usd\n",
+        "    ELSE 0\n",
+        "  END AS code_cost_usd,\n",
+        "  CASE\n",
+        "    WHEN genie_type = 'Genie One' THEN allocated_cost_usd\n",
+        "    ELSE 0\n",
+        "  END AS genie_one_cost_usd,\n",
+        "  allocated_dbu\n",
+        "FROM\n",
+        "  combined\n",
+        "WHERE\n",
+        "  user_email IS NOT NULL"
+      ]
+    },
+    {
+      "name": "token_surface",
+      "displayName": "Token cost by surface/channel",
+      "queryLines": [
+        "-- Portable version: LLM token cost by surface/channel from system tables\n",
+        "SELECT\n",
+        "  'production' AS environment,\n",
+        "  CASE u.usage_metadata.genie.surface\n",
+        "    WHEN 'GENIE_SPACE' THEN 'Genie Agents'\n",
+        "    WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "    WHEN 'GENIE_CODE' THEN 'Genie Code'\n",
+        "    WHEN 'GENIE_ONE' THEN 'Genie One'\n",
+        "    ELSE COALESCE(u.usage_metadata.genie.surface, 'Unknown')\n",
+        "  END AS surface,\n",
+        "  COALESCE(u.usage_metadata.genie.channel, 'direct') AS channel,\n",
+        "  COALESCE(u.usage_metadata.genie.agent_id, 'N/A') AS genie_space_name,\n",
+        "  u.identity_metadata.run_as AS user_email,\n",
+        "  u.usage_date,\n",
+        "  SUM(u.usage_quantity * lp.pricing.effective_list.default) AS cost_usd\n",
+        "FROM\n",
+        "  system.billing.usage u\n",
+        "    JOIN system.billing.list_prices lp\n",
+        "      ON u.cloud = lp.cloud\n",
+        "      AND u.sku_name = lp.sku_name\n",
+        "      AND u.usage_start_time >= lp.price_start_time\n",
+        "      AND (\n",
+        "        lp.price_end_time IS NULL\n",
+        "        OR u.usage_start_time < lp.price_end_time\n",
+        "      )\n",
+        "WHERE\n",
+        "  u.billing_origin_product = 'GENIE'\n",
+        "  AND u.usage_date >= CURRENT_DATE - INTERVAL 30 DAYS\n",
+        "GROUP BY\n",
+        "  ALL"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "main",
+      "displayName": "Cost Overview",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Genie & Compute Cost Dashboard"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Genie cost is now shown as **two clearly-separated components**: **Compute (SQL warehouse)** \u2014 warehouse $ attributed to Genie statements by task time (an *estimate*), and **LLM tokens (billed)** \u2014 actual pay-as-you-go token cost from `system.billing.usage` (`billing_origin_product = 'GENIE'`), split by Genie **surface**: Genie Agents, Genie Code, and Genie One. **Note:** account-wide LLM token billing began 2026-07-06, so the **token half reads $0 until usage data begins flowing** for this workspace; the compute half is populated today. Filter by environment, cost component, surface, room, compute, and user. 30-day window."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_env",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "environment",
+                      "expression": "`environment`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "environment",
+                    "displayName": "Environment",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Environment"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_type",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "genie_type",
+                      "expression": "`genie_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_type",
+                    "displayName": "Genie Type",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Type"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 3,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_space",
+            "queries": [
+              {
+                "name": "filter_genie_space_name",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "genie_space_name",
+                      "expression": "`genie_space_name`"
+                    },
+                    {
+                      "name": "genie_space_name_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "showTitle": true,
+                "title": "Genie"
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_space_name",
+                    "queryName": "filter_genie_space_name"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 3,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_wh",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "warehouse_id",
+                      "expression": "`warehouse_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "warehouse_id",
+                    "displayName": "Compute",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Compute (warehouse)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "User"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 5,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_date",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Date Range",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Date Range"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 5,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(allocated_cost_usd)",
+                  "displayName": "Genie Cost (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Cost (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_stmts",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(statements)",
+                      "expression": "SUM(`statements`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(statements)",
+                  "displayName": "SQL Statements"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "SQL Statements"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 7,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "countdistinct(user_email)",
+                      "expression": "COUNT(DISTINCT `user_email`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(user_email)",
+                  "displayName": "Active Users"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active Users"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 7,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_by_type",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "genie_type",
+                      "expression": "`genie_type`"
+                    },
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by Genie Type"
+              },
+              "mark": {
+                "colors": [
+                  {
+                    "themeColorType": "selectionColor"
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 2
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 3
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 4
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 5
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 6
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 7
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 8
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 9
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 10
+                  }
+                ]
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "genie_type",
+                  "displayName": "Genie Type",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(allocated_cost_usd)",
+                  "displayName": "Genie Cost (USD)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_over_time",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "genie_type",
+                      "expression": "`genie_type`"
+                    },
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Cost Over Time"
+              },
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(usage_date)",
+                  "displayName": "Date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(allocated_cost_usd)",
+                  "displayName": "Genie Cost (USD)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "genie_type",
+                  "displayName": "Genie Type",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Genie Agents",
+                        "color": {
+                          "themeColorType": "visualizationColors",
+                          "position": 6
+                        }
+                      },
+                      {
+                        "value": "Genie Code",
+                        "color": {
+                          "themeColorType": "visualizationColors",
+                          "position": 3
+                        }
+                      },
+                      {
+                        "value": "Genie One",
+                        "color": {
+                          "themeColorType": "selectionColor"
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "by_space",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "genie_space_name",
+                      "expression": "`genie_space_name`"
+                    },
+                    {
+                      "name": "genie_type",
+                      "expression": "`genie_type`"
+                    },
+                    {
+                      "name": "environment",
+                      "expression": "`environment`"
+                    },
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(statements)",
+                      "expression": "SUM(`statements`)"
+                    },
+                    {
+                      "name": "countdistinct(user_email)",
+                      "expression": "COUNT(DISTINCT `user_email`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by Genie"
+              },
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "genie_space_name",
+                    "displayName": "Genie"
+                  },
+                  {
+                    "fieldName": "genie_type",
+                    "displayName": "Genie Type"
+                  },
+                  {
+                    "fieldName": "environment",
+                    "displayName": "Environment"
+                  },
+                  {
+                    "fieldName": "sum(allocated_cost_usd)",
+                    "displayName": "Genie Cost (USD)"
+                  },
+                  {
+                    "fieldName": "sum(statements)",
+                    "displayName": "SQL Statements"
+                  },
+                  {
+                    "fieldName": "countdistinct(user_email)",
+                    "displayName": "Users"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 15,
+            "width": 12,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "by_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    },
+                    {
+                      "name": "genie_type",
+                      "expression": "`genie_type`"
+                    },
+                    {
+                      "name": "environment",
+                      "expression": "`environment`"
+                    },
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(statements)",
+                      "expression": "SUM(`statements`)"
+                    },
+                    {
+                      "name": "countdistinct(genie_space_id)",
+                      "expression": "COUNT(DISTINCT `genie_space_id`)"
+                    },
+                    {
+                      "name": "sum(compute_cost_usd)",
+                      "expression": "SUM(`compute_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(token_cost_usd)",
+                      "expression": "SUM(`token_cost_usd`)"
+                    },
+                    {
+                      "name": "countdistinct(usage_date)",
+                      "expression": "COUNT(DISTINCT `usage_date`)"
+                    },
+                    {
+                      "name": "max(usage_date)",
+                      "expression": "MAX(`usage_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "genie_type",
+                    "displayName": "Genie Type"
+                  },
+                  {
+                    "fieldName": "environment",
+                    "displayName": "Environment"
+                  },
+                  {
+                    "fieldName": "sum(allocated_cost_usd)",
+                    "displayName": "Genie Cost (USD)"
+                  },
+                  {
+                    "fieldName": "sum(statements)",
+                    "displayName": "SQL Statements"
+                  },
+                  {
+                    "fieldName": "countdistinct(genie_space_id)",
+                    "displayName": "Genies"
+                  },
+                  {
+                    "fieldName": "sum(compute_cost_usd)",
+                    "displayName": "Compute $"
+                  },
+                  {
+                    "fieldName": "sum(token_cost_usd)",
+                    "displayName": "LLM Tokens $"
+                  },
+                  {
+                    "fieldName": "countdistinct(usage_date)",
+                    "displayName": "Active Days"
+                  },
+                  {
+                    "fieldName": "max(usage_date)",
+                    "displayName": "Last Used"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by User (down to the person)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 12,
+            "height": 7
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    },
+    {
+      "name": "components",
+      "displayName": "Compute vs LLM Tokens",
+      "layout": [
+        {
+          "widget": {
+            "name": "divider_components",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Compute vs. LLM Token Cost"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_component",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "cost_component",
+                      "expression": "`cost_component`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "cost_component",
+                    "displayName": "Cost Component",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost Component"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_env_tok",
+            "queries": [
+              {
+                "name": "q_main",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "environment",
+                      "expression": "`environment`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_tok",
+                "query": {
+                  "datasetName": "token_surface",
+                  "fields": [
+                    {
+                      "name": "environment",
+                      "expression": "`environment`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "environment",
+                    "displayName": "Environment",
+                    "queryName": "q_main"
+                  },
+                  {
+                    "fieldName": "environment",
+                    "displayName": "Environment",
+                    "queryName": "q_tok"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Environment"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 1,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_date_tok",
+            "queries": [
+              {
+                "name": "q_main",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_tok",
+                "query": {
+                  "datasetName": "token_surface",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Date Range",
+                    "queryName": "q_main"
+                  },
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Date Range",
+                    "queryName": "q_tok"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Date Range"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 1,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_compute",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(compute_cost_usd)",
+                      "expression": "SUM(`compute_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(compute_cost_usd)",
+                  "displayName": "Compute Cost (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Compute Cost (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_token",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(token_cost_usd)",
+                      "expression": "SUM(`token_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(token_cost_usd)",
+                  "displayName": "LLM Tokens (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "LLM Tokens (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 3,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_by_component",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "cost_component",
+                      "expression": "`cost_component`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by Component (Compute vs LLM Tokens)"
+              },
+              "mark": {
+                "colors": [
+                  "#0C7F88",
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 2
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 3
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 4
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 5
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 6
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 7
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 8
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 9
+                  },
+                  {
+                    "themeColorType": "visualizationColors",
+                    "position": 10
+                  }
+                ]
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "cost_component",
+                  "displayName": "Cost Component",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "Cost (USD)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "component_over_time",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "cost_component",
+                      "expression": "`cost_component`"
+                    },
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Compute vs LLM Token Cost Over Time"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(usage_date)",
+                  "displayName": "Date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "Cost (USD)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "cost_component",
+                  "displayName": "Cost Component",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 5,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "token_by_surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "token_surface",
+                  "fields": [
+                    {
+                      "name": "surface",
+                      "expression": "`surface`"
+                    },
+                    {
+                      "name": "channel",
+                      "expression": "`channel`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    },
+                    {
+                      "name": "countdistinct(user_email)",
+                      "expression": "COUNT(DISTINCT `user_email`)"
+                    },
+                    {
+                      "name": "max(usage_date)",
+                      "expression": "MAX(`usage_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "surface",
+                    "displayName": "Surface"
+                  },
+                  {
+                    "fieldName": "channel",
+                    "displayName": "Channel"
+                  },
+                  {
+                    "fieldName": "sum(cost_usd)",
+                    "displayName": "LLM Tokens (USD)"
+                  },
+                  {
+                    "fieldName": "countdistinct(user_email)",
+                    "displayName": "Users"
+                  },
+                  {
+                    "fieldName": "max(usage_date)",
+                    "displayName": "Last Activity"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "LLM Tokens by Surface & Channel"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 11,
+            "width": 12,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_user_tok",
+            "queries": [
+              {
+                "name": "q_main",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_tok",
+                "query": {
+                  "datasetName": "token_surface",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User",
+                    "queryName": "q_main"
+                  },
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User",
+                    "queryName": "q_tok"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "User"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 1,
+            "width": 3,
+            "height": 2
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    },
+    {
+      "name": "user_summary",
+      "displayName": "User Genie Cost",
+      "layout": [
+        {
+          "widget": {
+            "name": "us_subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Cost per user split by Genie Agents, Genie Code, and Genie One, with total. Defaults to the last 30 days \u2014 adjust the date range or pick a user."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "us_filter_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "User"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "us_filter_date",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Date Range",
+                    "queryName": "main_query"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Date Range (default: last 30 days)"
+              },
+              "selection": {
+                "defaultSelection": {
+                  "range": {
+                    "dataType": "DATE",
+                    "min": {
+                      "value": "now-30d/d"
+                    },
+                    "max": {
+                      "value": "now/d"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 1,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "us_by_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "user_email",
+                      "expression": "`user_email`"
+                    },
+                    {
+                      "name": "sum(agents_cost_usd)",
+                      "expression": "SUM(`agents_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(code_cost_usd)",
+                      "expression": "SUM(`code_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(genie_one_cost_usd)",
+                      "expression": "SUM(`genie_one_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(statements)",
+                      "expression": "SUM(`statements`)"
+                    },
+                    {
+                      "name": "countdistinct(usage_date)",
+                      "expression": "COUNT(DISTINCT `usage_date`)"
+                    },
+                    {
+                      "name": "max(usage_date)",
+                      "expression": "MAX(`usage_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "user_email",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "sum(agents_cost_usd)",
+                    "displayName": "Genie Agents $",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "sum(code_cost_usd)",
+                    "displayName": "Genie Code $",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "sum(genie_one_cost_usd)",
+                    "displayName": "Genie One $",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "sum(allocated_cost_usd)",
+                    "displayName": "Total $",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "sum(statements)",
+                    "displayName": "SQL Statements"
+                  },
+                  {
+                    "fieldName": "countdistinct(usage_date)",
+                    "displayName": "Active Days"
+                  },
+                  {
+                    "fieldName": "max(usage_date)",
+                    "displayName": "Last Used"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Cost by User (by type + total)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 12,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "us_kpi_total",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(allocated_cost_usd)",
+                      "expression": "SUM(`allocated_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(allocated_cost_usd)",
+                  "displayName": "Total Genie Cost",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    },
+                    "abbreviation": "compact"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Total Genie Cost"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "us_kpi_agents",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(agents_cost_usd)",
+                      "expression": "SUM(`agents_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(agents_cost_usd)",
+                  "displayName": "Genie Agents $",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    },
+                    "abbreviation": "compact"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Agents $"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "us_kpi_code",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(code_cost_usd)",
+                      "expression": "SUM(`code_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(code_cost_usd)",
+                  "displayName": "Genie Code $",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    },
+                    "abbreviation": "compact"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Code $"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "us_kpi_one",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_cost",
+                  "fields": [
+                    {
+                      "name": "sum(genie_one_cost_usd)",
+                      "expression": "SUM(`genie_one_cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(genie_one_cost_usd)",
+                  "displayName": "Genie One $",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    },
+                    "abbreviation": "compact"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie One $"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
+  }
+}
